@@ -248,7 +248,7 @@ class KavitaApiPlugin implements Plugin.PluginBase {
   id = 'kavita-api';
   name = 'Kavita';
   icon = 'src/multi/kavita/icon.png';
-  version = '0.0.2';
+  version = '0.0.7';
   site = storage.get('url');
   apiKey = storage.get('apiKey');
 
@@ -1037,47 +1037,76 @@ class KavitaApiPlugin implements Plugin.PluginBase {
 
     await this.ensureToken();
 
-    const url =
-      `${this.baseUrl}/api/Search/search` +
-      `?queryString=${encodeURIComponent(query)}` +
-      `&includeChapterAndFiles=false`;
+    const pageSize = 12;
+    const currentPage = Math.max(pageNo || 1, 1);
+
+    const fb = new KavitaFilterBuilder('LNReader: Search')
+      .combination(KavitaCombination.MatchAll)
+      .sortBy(KavitaField.SeriesName, true)
+      .limitTo(0)
+      .whereSeriesName(KavitaComparison.Matches, query);
+
+    const formatImageOn = this.getBoolSetting('formatImage', false);
+    const formatArchiveOn = this.getBoolSetting('formatArchive', false);
+    const formatEpubOn = this.getBoolSetting('formatEpub', true);
+    const formatPdfOn = this.getBoolSetting('formatPdf', true);
+
+    const selectedFormatIds: string[] = [];
+    if (formatImageOn) selectedFormatIds.push('0'); // Image
+    if (formatArchiveOn) selectedFormatIds.push('1'); // Archive
+    if (formatEpubOn) selectedFormatIds.push('3'); // EPUB
+    if (formatPdfOn) selectedFormatIds.push('4'); // PDF
+
+    if (selectedFormatIds.length > 0) {
+      fb.whereFormatsContains(selectedFormatIds);
+    }
+
+    const body = fb.build();
+
+    const url = `${this.baseUrl}/api/Series/v2?PageNumber=${currentPage}&PageSize=${pageSize}`;
 
     const res = await fetchApi(url, {
-      method: 'GET',
+      method: 'POST',
       headers: {
-        Accept: 'application/json',
+        Accept: 'text/plain',
+        'Content-Type': 'application/json',
         ...this.getAuthHeaders(),
       },
+      body: JSON.stringify(body),
     });
 
     const text = await res.text();
 
-    let data: any;
+    let data: any = [];
     try {
       data = JSON.parse(text);
     } catch {
+      console.warn('Kavita API: searchNovels - invalid JSON response');
       return [];
     }
 
-    const seriesResults: any[] =
-      data?.series || data?.seriesResults || data?.seriesDtos || [];
+    const seriesResults: any[] = Array.isArray(data)
+      ? data
+      : data?.series || data?.seriesResults || data?.seriesDtos || [];
 
-    const novels: Plugin.NovelItem[] = seriesResults.map((s: any) => {
-      const seriesId = s.seriesId ?? s.id;
-      const name = s.name ?? s.seriesName ?? 'Unknown series';
+    const novels: Plugin.NovelItem[] = seriesResults
+      .filter(Boolean)
+      .map((series: any) => {
+        const seriesId = series?.seriesId ?? series?.id;
+        const name = series?.name ?? series?.seriesName ?? 'Unknown series';
 
-      const cover = seriesId
-        ? `${this.baseUrl}/api/image/series-cover?seriesId=${seriesId}${
-            this.apiKey ? `&apiKey=${this.apiKey}` : ''
-          }`
-        : defaultCover;
+        const cover = seriesId
+          ? `${this.baseUrl}/api/image/series-cover?seriesId=${seriesId}${
+              this.apiKey ? `&apiKey=${this.apiKey}` : ''
+            }`
+          : defaultCover;
 
-      return {
-        name,
-        path: String(seriesId),
-        cover,
-      };
-    });
+        return {
+          name,
+          path: String(seriesId),
+          cover,
+        };
+      });
 
     return novels;
   }
