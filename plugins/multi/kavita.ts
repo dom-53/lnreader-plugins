@@ -69,6 +69,18 @@ enum KavitaCombination {
   MatchAll = 1,
 }
 
+enum KavitaSortField {
+  SortName = 1,
+  Created = 2,
+  LastModified = 3,
+  ItemAdded = 4,
+  TimeToRead = 5,
+  ReleaseYear = 6,
+  LastRead = 7,
+  AverageRating = 8,
+  Random = 9,
+}
+
 type KavitaFilterStatementDto = {
   field: KavitaField;
   comparison: KavitaComparison;
@@ -76,6 +88,7 @@ type KavitaFilterStatementDto = {
 };
 
 type KavitaFilterV2Dto = {
+  id?: number;
   name: string;
   combination: KavitaCombination;
   statements: KavitaFilterStatementDto[];
@@ -90,7 +103,7 @@ class KavitaFilterBuilder {
   private _name: string;
   private _combination: KavitaCombination = KavitaCombination.MatchAll;
   private _statements: KavitaFilterStatementDto[] = [];
-  private _sortField: number = KavitaField.SeriesName;
+  private _sortField: number = KavitaSortField.SortName;
   private _sortAscending = true;
   private _limitTo = 0;
 
@@ -103,7 +116,7 @@ class KavitaFilterBuilder {
     return this;
   }
 
-  sortBy(field: KavitaField, ascending = true) {
+  sortBy(field: number, ascending = true) {
     this._sortField = field;
     this._sortAscending = ascending;
     return this;
@@ -208,6 +221,27 @@ class KavitaFilterBuilder {
     return this;
   }
 
+  whereWantToRead(value: boolean | string) {
+    const normalized =
+      typeof value === 'string' ? value.trim().toLowerCase() : value;
+
+    if (normalized === true || normalized === false) {
+      this._statements.push({
+        field: KavitaField.WantToRead,
+        comparison: KavitaComparison.Equal,
+        value: normalized ? 'true' : 'false',
+      });
+    } else if (normalized === 'true' || normalized === 'false') {
+      this._statements.push({
+        field: KavitaField.WantToRead,
+        comparison: KavitaComparison.Equal,
+        value: normalized,
+      });
+    }
+
+    return this;
+  }
+
   whereTagsInclude(ids: string[]) {
     if (!ids || ids.length === 0) return this;
     this._statements.push({
@@ -222,6 +256,26 @@ class KavitaFilterBuilder {
     if (!ids || ids.length === 0) return this;
     this._statements.push({
       field: KavitaField.Tags,
+      comparison: KavitaComparison.NotContains,
+      value: ids.join(','),
+    });
+    return this;
+  }
+
+  whereCollectionTagsInclude(ids: string[]) {
+    if (!ids || ids.length === 0) return this;
+    this._statements.push({
+      field: KavitaField.CollectionTags,
+      comparison: KavitaComparison.Contains,
+      value: ids.join(','),
+    });
+    return this;
+  }
+
+  whereCollectionTagsExclude(ids: string[]) {
+    if (!ids || ids.length === 0) return this;
+    this._statements.push({
+      field: KavitaField.CollectionTags,
       comparison: KavitaComparison.NotContains,
       value: ids.join(','),
     });
@@ -248,11 +302,12 @@ class KavitaApiPlugin implements Plugin.PluginBase {
   id = 'kavita-api';
   name = 'Kavita';
   icon = 'src/multi/kavita/icon.png';
-  version = '0.0.7';
+  version = '0.0.8';
   site = storage.get('url');
   apiKey = storage.get('apiKey');
 
   private _filtersLoaded = false;
+  private _presetFilterMap = new Map<string, string>();
 
   private async ensureFilterOptionsLoaded() {
     if (this._filtersLoaded) return;
@@ -263,6 +318,35 @@ class KavitaApiPlugin implements Plugin.PluginBase {
     }
 
     await this.ensureToken();
+
+    try {
+      const presetFilters = await this.apiGet<any[]>('/api/Filter');
+
+      this._presetFilterMap.clear();
+
+      const presetOptions: FilterOption[] = [
+        {
+          label: 'None',
+          value: '',
+        },
+      ];
+
+      for (const preset of presetFilters || []) {
+        if (!preset || preset.id == null || typeof preset.filter !== 'string')
+          continue;
+
+        const idStr = String(preset.id);
+        this._presetFilterMap.set(idStr, preset.filter);
+        presetOptions.push({
+          label: preset.name || `Filter ${idStr}`,
+          value: idStr,
+        });
+      }
+
+      (this._filters.presetFilter as any).options = presetOptions;
+    } catch (e) {
+      console.warn('Kavita: failed to load preset filters', e);
+    }
 
     try {
       const tags = await this.apiGet<any[]>('/api/metadata/tags');
@@ -306,11 +390,124 @@ class KavitaApiPlugin implements Plugin.PluginBase {
       console.warn('Kavita: failed to load libraries', e);
     }
 
+    try {
+      const collections = await this.apiGet<any[]>(
+        '/api/collection?ownedOnly=false',
+      );
+      (this._filters.collectionTags as any).options = collections.map(c => ({
+        label: c.title,
+        value: String(c.id),
+      }));
+    } catch (e) {
+      console.warn('Kavita: failed to load collections', e);
+    }
+
     this._filtersLoaded = true;
+  }
+
+  private async decodePresetFilter(
+    encodedFilter: string,
+  ): Promise<KavitaFilterV2Dto | null> {
+    if (!encodedFilter) return null;
+
+    await this.ensureToken();
+
+    let text: string | undefined;
+    try {
+      const res = await fetchApi(`${this.baseUrl}/api/Filter/decode`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          ...this.getAuthHeaders(),
+        },
+        body: JSON.stringify({ encodedFilter }),
+      });
+
+      text = await res.text();
+    } catch (e) {
+      console.warn('Kavita: failed to decode preset filter (request)', e);
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(text as string) as any;
+
+      const combinationValue = Number(parsed?.combination);
+      const combination =
+        combinationValue === KavitaCombination.MatchAny
+          ? KavitaCombination.MatchAny
+          : KavitaCombination.MatchAll;
+
+      const statements: KavitaFilterStatementDto[] = Array.isArray(
+        parsed?.statements,
+      )
+        ? (parsed.statements
+            .map((stmt: any) => {
+              const field = Number(stmt?.field);
+              const comparison = Number(stmt?.comparison);
+
+              if (Number.isNaN(field) || Number.isNaN(comparison)) return null;
+
+              return {
+                field: field as KavitaField,
+                comparison: comparison as KavitaComparison,
+                value:
+                  stmt?.value === null || stmt?.value === undefined
+                    ? undefined
+                    : String(stmt.value),
+              };
+            })
+            .filter(Boolean) as KavitaFilterStatementDto[])
+        : [];
+
+      const sortFieldRaw = Number(parsed?.sortOptions?.sortField);
+      const sortAscendingRaw = parsed?.sortOptions?.isAscending;
+
+      const sortAscending =
+        typeof sortAscendingRaw === 'boolean'
+          ? sortAscendingRaw
+          : typeof sortAscendingRaw === 'string'
+            ? sortAscendingRaw.toLowerCase() === 'true'
+            : true;
+
+      const sortOptions = {
+        sortField: Number.isNaN(sortFieldRaw)
+          ? KavitaSortField.SortName
+          : sortFieldRaw,
+        isAscending: sortAscending,
+      };
+
+      const limitToRaw = Number(parsed?.limitTo);
+
+      const id =
+        typeof parsed?.id === 'number' && Number.isFinite(parsed.id)
+          ? parsed.id
+          : undefined;
+
+      return {
+        id,
+        name: parsed?.name || 'Preset filter',
+        combination,
+        statements,
+        sortOptions,
+        limitTo: Number.isNaN(limitToRaw) ? 0 : limitToRaw,
+      };
+    } catch (e) {
+      console.warn('Kavita: failed to decode preset filter (parse)', e, text);
+      return null;
+    }
   }
 
   // ---- Filters exposed to the LNReader UI ----
   private _filters: Filters = {
+    presetFilter: {
+      label: 'Preset filter',
+      type: FilterTypes.Picker,
+      options: [{ label: 'None', value: '' }] as readonly FilterOption[],
+      value: '',
+    },
+
     filterCombination: {
       label: 'Filter combination',
       type: FilterTypes.Picker,
@@ -327,9 +524,46 @@ class KavitaApiPlugin implements Plugin.PluginBase {
       value: String(KavitaCombination.MatchAll),
     },
 
-    // ---------- Genres (loaded from /api/metadata/genres) ----------
-    genres: {
-      label: 'Genres',
+    sortField: {
+      label: 'Sort by',
+      type: FilterTypes.Picker,
+      options: [
+        { label: 'Sort Name', value: String(KavitaSortField.SortName) },
+        { label: 'Created', value: String(KavitaSortField.Created) },
+        { label: 'Last Modified', value: String(KavitaSortField.LastModified) },
+        { label: 'Item Added', value: String(KavitaSortField.ItemAdded) },
+        { label: 'Time to Read', value: String(KavitaSortField.TimeToRead) },
+        { label: 'Release Year', value: String(KavitaSortField.ReleaseYear) },
+        { label: 'Last Read', value: String(KavitaSortField.LastRead) },
+        {
+          label: 'Average Rating',
+          value: String(KavitaSortField.AverageRating),
+        },
+        { label: 'Random', value: String(KavitaSortField.Random) },
+      ] as const,
+      value: String(KavitaSortField.SortName),
+    },
+
+    sortDirection: {
+      label: 'Sort direction',
+      type: FilterTypes.Picker,
+      options: [
+        { label: 'Ascending', value: 'true' },
+        { label: 'Descending', value: 'false' },
+      ] as const,
+      value: 'true',
+    },
+
+    // ---------- Limit ----------
+    limitTo: {
+      label: 'Limit results (0 = no limit)',
+      type: FilterTypes.TextInput,
+      value: '0',
+    },
+
+    // ---------- Libraries (loaded from /api/library/libraries) ----------
+    libraries: {
+      label: 'Libraries',
       type: FilterTypes.ExcludableCheckboxGroup,
       options: [] as readonly FilterOption[], // populated dynamically
       value: {
@@ -349,15 +583,44 @@ class KavitaApiPlugin implements Plugin.PluginBase {
       },
     },
 
-    // ---------- Libraries (loaded from /api/library/libraries) ----------
-    libraries: {
-      label: 'Libraries',
+    collectionTags: {
+      label: 'Collections',
       type: FilterTypes.ExcludableCheckboxGroup,
       options: [] as readonly FilterOption[], // populated dynamically
       value: {
         include: [],
         exclude: [],
       },
+    },
+
+    wantToRead: {
+      label: 'Want to read',
+      type: FilterTypes.Picker,
+      options: [
+        { label: 'Any', value: '' },
+        { label: 'Must be marked', value: 'true' },
+        { label: 'Must NOT be marked', value: 'false' },
+      ] as const,
+      value: '',
+    },
+
+    // ---------- Series Name ----------
+    seriesNameComparison: {
+      label: 'Series name operator',
+      type: FilterTypes.Picker,
+      options: [
+        { label: 'Equal', value: String(KavitaComparison.Equal) },
+        { label: 'Not equal', value: String(KavitaComparison.NotEqual) },
+        { label: 'Begins with', value: String(KavitaComparison.BeginsWith) },
+        { label: 'Ends with', value: String(KavitaComparison.EndsWith) },
+        { label: 'Matches', value: String(KavitaComparison.Matches) },
+      ] as readonly FilterOption[],
+      value: String(KavitaComparison.Matches),
+    },
+    seriesNameValue: {
+      label: 'Series name',
+      type: FilterTypes.TextInput,
+      value: '',
     },
 
     // ---------- Release Year ----------
@@ -388,23 +651,15 @@ class KavitaApiPlugin implements Plugin.PluginBase {
       value: '',
     },
 
-    // ---------- Series Name ----------
-    seriesNameComparison: {
-      label: 'Series name operator',
-      type: FilterTypes.Picker,
-      options: [
-        { label: 'Equal', value: String(KavitaComparison.Equal) },
-        { label: 'Not equal', value: String(KavitaComparison.NotEqual) },
-        { label: 'Begins with', value: String(KavitaComparison.BeginsWith) },
-        { label: 'Ends with', value: String(KavitaComparison.EndsWith) },
-        { label: 'Matches', value: String(KavitaComparison.Matches) },
-      ] as readonly FilterOption[],
-      value: String(KavitaComparison.Matches),
-    },
-    seriesNameValue: {
-      label: 'Series name',
-      type: FilterTypes.TextInput,
-      value: '',
+    // ---------- Genres (loaded from /api/metadata/genres) ----------
+    genres: {
+      label: 'Genres',
+      type: FilterTypes.ExcludableCheckboxGroup,
+      options: [] as readonly FilterOption[], // populated dynamically
+      value: {
+        include: [],
+        exclude: [],
+      },
     },
 
     // ---------- Tags (loaded from /api/metadata/tags) ----------
@@ -517,222 +772,351 @@ class KavitaApiPlugin implements Plugin.PluginBase {
     await this.ensureFilterOptionsLoaded();
 
     const pageSize = 30;
-    // Build a FilterV2 body that mirrors what the Kavita web UI would receive.
-    // Helper to apply include/exclude arrays from the ExcludableCheckboxGroup filters.
-    const applyIncludeExcludeFilter = (
-      key: keyof Filters,
-      includeHandler: (ids: string[]) => void,
-      excludeHandler: (ids: string[]) => void,
-    ): boolean => {
-      const raw = (filters as any)?.[key];
-      if (
-        !raw ||
-        raw.type !== FilterTypes.ExcludableCheckboxGroup ||
-        typeof raw !== 'object'
-      ) {
-        return false;
-      }
+    const presetFilterRaw = (filters as any)?.presetFilter as
+      | {
+          type: FilterTypes.Picker;
+          value?: string;
+        }
+      | undefined;
 
-      const value = (raw.value || {}) as {
-        include?: string[];
-        exclude?: string[];
+    const presetFilterId =
+      presetFilterRaw &&
+      presetFilterRaw.type === FilterTypes.Picker &&
+      typeof presetFilterRaw.value === 'string'
+        ? presetFilterRaw.value.trim()
+        : '';
+
+    let presetFilterBody: KavitaFilterV2Dto | null = null;
+
+    if (presetFilterId) {
+      const encodedPreset = this._presetFilterMap.get(presetFilterId);
+      if (encodedPreset) {
+        presetFilterBody = await this.decodePresetFilter(encodedPreset);
+      } else {
+        console.warn(
+          `Kavita: preset filter ${presetFilterId} missing from cache`,
+        );
+      }
+    }
+
+    const presetFilterSelected = Boolean(presetFilterId);
+    let hasUserFilters = presetFilterSelected;
+    let body: KavitaFilterV2Dto;
+
+    if (presetFilterBody) {
+      hasUserFilters = true;
+      body = presetFilterBody;
+    } else if (presetFilterSelected) {
+      body = new KavitaFilterBuilder('LNReader: Preset (fallback)')
+        .combination(KavitaCombination.MatchAll)
+        .sortBy(KavitaSortField.SortName, true)
+        .limitTo(0)
+        .build();
+    } else {
+      // Build a FilterV2 body that mirrors what the Kavita web UI would receive.
+      // Helper to apply include/exclude arrays from the ExcludableCheckboxGroup filters.
+      const applyIncludeExcludeFilter = (
+        key: keyof Filters,
+        includeHandler: (ids: string[]) => void,
+        excludeHandler: (ids: string[]) => void,
+      ): boolean => {
+        const raw = (filters as any)?.[key];
+        if (
+          !raw ||
+          raw.type !== FilterTypes.ExcludableCheckboxGroup ||
+          typeof raw !== 'object'
+        ) {
+          return false;
+        }
+
+        const value = (raw.value || {}) as {
+          include?: string[];
+          exclude?: string[];
+        };
+
+        let updated = false;
+
+        const includeIds = Array.isArray(value.include) ? value.include : [];
+        if (includeIds.length > 0) {
+          includeHandler(includeIds);
+          updated = true;
+        }
+
+        const excludeIds = Array.isArray(value.exclude) ? value.exclude : [];
+        if (excludeIds.length > 0) {
+          excludeHandler(excludeIds);
+          updated = true;
+        }
+
+        return updated;
       };
 
-      let updated = false;
+      // 1) read combination from Picker
+      let combination: KavitaCombination = KavitaCombination.MatchAll;
 
-      const includeIds = Array.isArray(value.include) ? value.include : [];
-      if (includeIds.length > 0) {
-        includeHandler(includeIds);
-        updated = true;
-      }
+      const combinationRaw = (filters as any)?.filterCombination as
+        | {
+            type: FilterTypes.Picker;
+            value?: string;
+          }
+        | undefined;
 
-      const excludeIds = Array.isArray(value.exclude) ? value.exclude : [];
-      if (excludeIds.length > 0) {
-        excludeHandler(excludeIds);
-        updated = true;
-      }
-
-      return updated;
-    };
-
-    // 1) přečteme kombinaci z Pickeru
-    let combination: KavitaCombination = KavitaCombination.MatchAll;
-
-    const combinationRaw = (filters as any)?.filterCombination as
-      | {
-          type: FilterTypes.Picker;
-          value?: string;
-        }
-      | undefined;
-
-    if (
-      combinationRaw &&
-      combinationRaw.type === FilterTypes.Picker &&
-      typeof combinationRaw.value === 'string'
-    ) {
-      const parsed = Number(combinationRaw.value);
       if (
-        parsed === KavitaCombination.MatchAny ||
-        parsed === KavitaCombination.MatchAll
+        combinationRaw &&
+        combinationRaw.type === FilterTypes.Picker &&
+        typeof combinationRaw.value === 'string'
       ) {
-        combination = parsed;
-      }
-    }
-
-    // Track whether the user actually set any filter (genres/status/libraries/year/name/tags)
-    let hasUserFilters = false;
-
-    // 2) builder pro FilterV2Dto
-    const fb = new KavitaFilterBuilder('LNReader: Recently Added')
-      .combination(combination)
-      .sortBy(KavitaField.SeriesName, true)
-      .limitTo(0);
-
-    if (
-      applyIncludeExcludeFilter(
-        'genres',
-        ids => fb.whereGenresInclude(ids),
-        ids => fb.whereGenresExclude(ids),
-      )
-    ) {
-      hasUserFilters = true;
-    }
-
-    if (
-      applyIncludeExcludeFilter(
-        'publicationStatus',
-        ids => fb.wherePublicationStatusInclude(ids),
-        ids => fb.wherePublicationStatusExclude(ids),
-      )
-    ) {
-      hasUserFilters = true;
-    }
-
-    if (
-      applyIncludeExcludeFilter(
-        'libraries',
-        ids => fb.whereLibrariesInclude(ids),
-        ids => fb.whereLibrariesExclude(ids),
-      )
-    ) {
-      hasUserFilters = true;
-    }
-
-    // --- Release Year (TextInput + Picker) ---
-    const releaseYearValueRaw = (filters as any)?.releaseYearValue as
-      | {
-          type: FilterTypes.TextInput;
-          value?: string;
-        }
-      | undefined;
-
-    const releaseYearComparisonRaw = (filters as any)?.releaseYearComparison as
-      | {
-          type: FilterTypes.Picker;
-          value?: string;
-        }
-      | undefined;
-
-    if (
-      releaseYearValueRaw &&
-      releaseYearValueRaw.type === FilterTypes.TextInput
-    ) {
-      const rawYear = (releaseYearValueRaw.value ?? '').trim();
-
-      if (rawYear) {
-        let comparison = KavitaComparison.Equal;
-
+        const parsed = Number(combinationRaw.value);
         if (
-          releaseYearComparisonRaw &&
-          releaseYearComparisonRaw.type === FilterTypes.Picker &&
-          typeof releaseYearComparisonRaw.value === 'string'
+          parsed === KavitaCombination.MatchAny ||
+          parsed === KavitaCombination.MatchAll
         ) {
-          const parsed = Number(releaseYearComparisonRaw.value);
-          if (!Number.isNaN(parsed)) {
-            comparison = parsed as KavitaComparison;
+          combination = parsed;
+        }
+      }
+
+      // Track whether the user actually set any filter (genres/status/libraries/year/name/tags)
+      hasUserFilters = false;
+
+      // --- Result limit ---
+      let limitTo = 0;
+      const limitToRaw = (filters as any)?.limitTo as
+        | { type: FilterTypes.TextInput; value?: string }
+        | undefined;
+      if (limitToRaw && limitToRaw.type === FilterTypes.TextInput) {
+        const raw = String(limitToRaw.value ?? '').trim();
+        if (raw) {
+          const parsed = Number(raw);
+          if (Number.isFinite(parsed) && parsed >= 0) {
+            limitTo = parsed;
+            if (parsed > 0) hasUserFilters = true;
           }
         }
-
-        fb.whereReleaseYear(comparison, rawYear);
-        hasUserFilters = true;
       }
-    }
 
-    // --- Series Name (TextInput + Picker) ---
-    const seriesNameValueRaw = (filters as any)?.seriesNameValue as
-      | {
-          type: FilterTypes.TextInput;
-          value?: string;
-        }
-      | undefined;
+      // --- Sorting (Picker + Picker) ---
+      let sortField: number = KavitaSortField.SortName;
+      let sortAscending = true;
 
-    const seriesNameComparisonRaw = (filters as any)?.seriesNameComparison as
-      | {
-          type: FilterTypes.Picker;
-          value?: string;
-        }
-      | undefined;
-
-    if (
-      seriesNameValueRaw &&
-      seriesNameValueRaw.type === FilterTypes.TextInput
-    ) {
-      const rawName = (seriesNameValueRaw.value ?? '').trim();
-
-      if (rawName) {
-        let comparison = KavitaComparison.Matches;
-
-        if (
-          seriesNameComparisonRaw &&
-          seriesNameComparisonRaw.type === FilterTypes.Picker &&
-          typeof seriesNameComparisonRaw.value === 'string'
-        ) {
-          const parsed = Number(seriesNameComparisonRaw.value);
-          if (!Number.isNaN(parsed)) {
-            comparison = parsed as KavitaComparison;
+      const sortFieldRaw = (filters as any)?.sortField as
+        | {
+            type: FilterTypes.Picker;
+            value?: string;
           }
-        }
+        | undefined;
 
-        fb.whereSeriesName(comparison, rawName);
+      if (
+        sortFieldRaw &&
+        sortFieldRaw.type === FilterTypes.Picker &&
+        typeof sortFieldRaw.value === 'string'
+      ) {
+        const parsed = Number(sortFieldRaw.value);
+        if (!Number.isNaN(parsed)) {
+          sortField = parsed;
+        }
+      }
+
+      const sortDirectionRaw = (filters as any)?.sortDirection as
+        | {
+            type: FilterTypes.Picker;
+            value?: string;
+          }
+        | undefined;
+
+      if (
+        sortDirectionRaw &&
+        sortDirectionRaw.type === FilterTypes.Picker &&
+        typeof sortDirectionRaw.value === 'string'
+      ) {
+        sortAscending = sortDirectionRaw.value.toLowerCase() === 'true';
+      }
+
+      if (sortField !== KavitaSortField.SortName || sortAscending !== true) {
         hasUserFilters = true;
       }
+
+      // 2) builder pro FilterV2Dto
+      const fb = new KavitaFilterBuilder('LNReader: Recently Added')
+        .combination(combination)
+        .sortBy(sortField, sortAscending)
+        .limitTo(limitTo);
+
+      if (
+        applyIncludeExcludeFilter(
+          'genres',
+          ids => fb.whereGenresInclude(ids),
+          ids => fb.whereGenresExclude(ids),
+        )
+      ) {
+        hasUserFilters = true;
+      }
+
+      if (
+        applyIncludeExcludeFilter(
+          'publicationStatus',
+          ids => fb.wherePublicationStatusInclude(ids),
+          ids => fb.wherePublicationStatusExclude(ids),
+        )
+      ) {
+        hasUserFilters = true;
+      }
+
+      if (
+        applyIncludeExcludeFilter(
+          'libraries',
+          ids => fb.whereLibrariesInclude(ids),
+          ids => fb.whereLibrariesExclude(ids),
+        )
+      ) {
+        hasUserFilters = true;
+      }
+
+      // --- Release Year (TextInput + Picker) ---
+      const releaseYearValueRaw = (filters as any)?.releaseYearValue as
+        | {
+            type: FilterTypes.TextInput;
+            value?: string;
+          }
+        | undefined;
+
+      const releaseYearComparisonRaw = (filters as any)
+        ?.releaseYearComparison as
+        | {
+            type: FilterTypes.Picker;
+            value?: string;
+          }
+        | undefined;
+
+      if (
+        releaseYearValueRaw &&
+        releaseYearValueRaw.type === FilterTypes.TextInput
+      ) {
+        const rawYear = (releaseYearValueRaw.value ?? '').trim();
+
+        if (rawYear) {
+          let comparison = KavitaComparison.Equal;
+
+          if (
+            releaseYearComparisonRaw &&
+            releaseYearComparisonRaw.type === FilterTypes.Picker &&
+            typeof releaseYearComparisonRaw.value === 'string'
+          ) {
+            const parsed = Number(releaseYearComparisonRaw.value);
+            if (!Number.isNaN(parsed)) {
+              comparison = parsed as KavitaComparison;
+            }
+          }
+
+          fb.whereReleaseYear(comparison, rawYear);
+          hasUserFilters = true;
+        }
+      }
+
+      // --- Series Name (TextInput + Picker) ---
+      const seriesNameValueRaw = (filters as any)?.seriesNameValue as
+        | {
+            type: FilterTypes.TextInput;
+            value?: string;
+          }
+        | undefined;
+
+      const seriesNameComparisonRaw = (filters as any)?.seriesNameComparison as
+        | {
+            type: FilterTypes.Picker;
+            value?: string;
+          }
+        | undefined;
+
+      if (
+        seriesNameValueRaw &&
+        seriesNameValueRaw.type === FilterTypes.TextInput
+      ) {
+        const rawName = (seriesNameValueRaw.value ?? '').trim();
+
+        if (rawName) {
+          let comparison = KavitaComparison.Matches;
+
+          if (
+            seriesNameComparisonRaw &&
+            seriesNameComparisonRaw.type === FilterTypes.Picker &&
+            typeof seriesNameComparisonRaw.value === 'string'
+          ) {
+            const parsed = Number(seriesNameComparisonRaw.value);
+            if (!Number.isNaN(parsed)) {
+              comparison = parsed as KavitaComparison;
+            }
+          }
+
+          fb.whereSeriesName(comparison, rawName);
+          hasUserFilters = true;
+        }
+      }
+
+      if (
+        applyIncludeExcludeFilter(
+          'tags',
+          ids => fb.whereTagsInclude(ids),
+          ids => fb.whereTagsExclude(ids),
+        )
+      ) {
+        hasUserFilters = true;
+      }
+
+      if (
+        applyIncludeExcludeFilter(
+          'collectionTags',
+          ids => fb.whereCollectionTagsInclude(ids),
+          ids => fb.whereCollectionTagsExclude(ids),
+        )
+      ) {
+        hasUserFilters = true;
+      }
+
+      // --- Want To Read (Picker) ---
+      const wantToReadRaw = (filters as any)?.wantToRead as
+        | { type: FilterTypes.Picker; value?: string }
+        | undefined;
+
+      if (
+        wantToReadRaw &&
+        wantToReadRaw.type === FilterTypes.Picker &&
+        typeof wantToReadRaw.value === 'string'
+      ) {
+        const v = wantToReadRaw.value.trim().toLowerCase();
+        if (v === 'true' || v === 'false') {
+          fb.whereWantToRead(v);
+          hasUserFilters = true;
+        }
+      }
+
+      // --- Formats sourced from pluginSettings (Switch) ---
+      // These are global toggles, not per-request filters, so they do not flip hasUserFilters.
+      const formatImageOn = this.getBoolSetting('formatImage', false);
+      const formatArchiveOn = this.getBoolSetting('formatArchive', false);
+      const formatEpubOn = this.getBoolSetting('formatEpub', false);
+      const formatPdfOn = this.getBoolSetting('formatPdf', false);
+
+      const selectedFormatIds: string[] = [];
+      // Map the boolean switches to the numeric identifiers used by Kavita.
+      if (formatImageOn) selectedFormatIds.push('0'); // Image
+      if (formatArchiveOn) selectedFormatIds.push('1'); // Archive
+      if (formatEpubOn) selectedFormatIds.push('3'); // EPUB
+      if (formatPdfOn) selectedFormatIds.push('4'); // PDF
+
+      if (selectedFormatIds.length > 0) {
+        fb.whereFormatsContains(selectedFormatIds);
+        // hasUserFilters stays unchanged because this is a global preference
+      }
+
+      body = fb.build();
     }
-
-    if (
-      applyIncludeExcludeFilter(
-        'tags',
-        ids => fb.whereTagsInclude(ids),
-        ids => fb.whereTagsExclude(ids),
-      )
-    ) {
-      hasUserFilters = true;
-    }
-
-    // --- Formats sourced from pluginSettings (Switch) ---
-    // These are global toggles, not per-request filters, so they do not flip hasUserFilters.
-    const formatImageOn = this.getBoolSetting('formatImage', false);
-    const formatArchiveOn = this.getBoolSetting('formatArchive', false);
-    const formatEpubOn = this.getBoolSetting('formatEpub', false);
-    const formatPdfOn = this.getBoolSetting('formatPdf', false);
-
-    const selectedFormatIds: string[] = [];
-    // Map the boolean switches to the numeric identifiers used by Kavita.
-    if (formatImageOn) selectedFormatIds.push('0'); // Image
-    if (formatArchiveOn) selectedFormatIds.push('1'); // Archive
-    if (formatEpubOn) selectedFormatIds.push('3'); // EPUB
-    if (formatPdfOn) selectedFormatIds.push('4'); // PDF
-
-    if (selectedFormatIds.length > 0) {
-      fb.whereFormatsContains(selectedFormatIds);
-      // hasUserFilters stays unchanged because this is a global preference
-    }
-
-    const body = fb.build();
 
     console.log('Kavita API: popularNovels', {
       pageNo,
       showLatestNovels,
       hasUserFilters,
+      usingPresetFilter: Boolean(presetFilterBody),
+      presetFilterSelected,
     });
 
     // When the "latest" toggle is on and no filters were supplied, hit the dedicated endpoint.
@@ -1042,7 +1426,7 @@ class KavitaApiPlugin implements Plugin.PluginBase {
 
     const fb = new KavitaFilterBuilder('LNReader: Search')
       .combination(KavitaCombination.MatchAll)
-      .sortBy(KavitaField.SeriesName, true)
+      .sortBy(KavitaSortField.SortName, true)
       .limitTo(0)
       .whereSeriesName(KavitaComparison.Matches, query);
 
